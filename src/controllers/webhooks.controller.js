@@ -7,17 +7,14 @@ export async function airtableWebhookHandler(req, res) {
   try {
     const body = req.body;
 
-    // 1️⃣ Handle Webhook Challenge Handshake FIRST
     if (body.challenge) {
       console.log("🔐 Airtable Challenge:", body.challenge);
       return res.json({ challenge: body.challenge });
     }
 
-    // 2️⃣ Handle Webhook Ping Events
     if (body.webhook && body.base) {
       console.log("📡 Received Airtable Ping:", body);
 
-      // Respond quickly so Airtable doesn't retry, then fetch payloads async
       res.status(200).json({ success: true, message: "Webhook ping received" });
 
       (async () => {
@@ -67,10 +64,9 @@ export async function airtableWebhookHandler(req, res) {
         }
       })();
 
-      return; // already responded
+      return; 
     }
 
-    // 3️⃣ Handle Record Updates/Deletes
     const { event, recordId, fields } = body;
 
     if (!recordId) {
@@ -85,7 +81,6 @@ export async function airtableWebhookHandler(req, res) {
   }
 }
 
-// Helper: process an array of Airtable change events and update local DB
 async function processEvents(events, form) {
   if (!Array.isArray(events)) return;
 
