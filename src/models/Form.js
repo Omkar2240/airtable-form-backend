@@ -26,6 +26,7 @@ const QuestionSchema = new Schema({
 const FormSchema = new Schema({
   ownerUserId: String,
   airtableBaseId: String,
+  webhookId: String,
   airtableTableId: String,
   title: String,
   questions: [QuestionSchema],
