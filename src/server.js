@@ -25,7 +25,7 @@ app.use(session({
   }
 }));
 app.use(cors({
-  origin: 'http://localhost:3000',
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
   credentials: true,
   allowedHeaders: ['Content-Type','Authorization','x-user-id'],
   methods: ['GET','POST']

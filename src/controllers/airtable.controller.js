@@ -9,7 +9,6 @@ import {
 import sha256 from "crypto-js/sha256.js";
 import Base64 from "crypto-js/enc-base64.js";
 
-//  move into utils
 
 // URL-safe Base64
 function base64url(base64) {
