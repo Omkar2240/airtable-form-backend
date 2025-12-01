@@ -20,8 +20,22 @@ export async function createForm(req, res) {
     // create webhook before form saving
     const user = await getUser(req);
     const airtableBaseId = form.airtableBaseId;
-    const webhook = await registerWebhook(user, airtableBaseId);
-    form.webhookId = webhook.id;
+    let webhook;
+    try {
+      webhook = await registerWebhook(user, airtableBaseId);
+    } catch (err) {
+      console.error("Error registering webhook:", err);
+      return res.status(500).json({ error: 'Failed to register or reuse webhook' });
+    }
+
+    // registerWebhook may return different shapes (Airtable create result or a reused webhook object)
+    const webhookId = webhook?.id || webhook?.webhook?.id || webhook;
+    if (!webhookId) {
+      console.error('Unable to determine webhook id from registerWebhook result:', webhook);
+      return res.status(500).json({ error: 'Invalid webhook response from Airtable' });
+    }
+
+    form.webhookId = webhookId;
     await form.save();
     res.json(form);
   } catch (err) {
