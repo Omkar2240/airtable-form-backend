@@ -25,20 +25,20 @@ export async function airtableWebhookHandler(req, res) {
           const baseId = body.base?.id;
           const webhookId = body.webhook?.id;
           if (!baseId || !webhookId) {
-            console.log('Ping missing base or webhook id, skipping payload fetch');
+            console.log('[Webhook] Ping missing base or webhook id, skipping payload fetch');
             return;
           }
 
           const form = await Form.findOne({ airtableBaseId: baseId, webhookId: webhookId });
           if (!form) {
-            console.log('No form found for webhook/base:', webhookId, baseId);
+            console.log('[Webhook] No form found for webhook/base:', webhookId, baseId);
             return;
           }
 
           let owner = await User.findById(form.ownerUserId);
           if (!owner) owner = await User.findOne({ airtableUserId: form.ownerUserId });
           if (!owner) {
-            console.log('No owner found for form; cannot fetch webhook payloads');
+            console.log('[Webhook] No owner found for form; cannot fetch payloads');
             return;
           }
 
@@ -48,12 +48,22 @@ export async function airtableWebhookHandler(req, res) {
           });
 
           const payloads = listRes.data?.payloads || listRes.data?.data || listRes.data || [];
-          for (const p of payloads) {
-            const changes = p?.changes || p?.payload?.changes || [];
-            await processEvents(changes);
+          console.log(`[Webhook] Retrieved ${payloads.length} payload(s) for webhook ${webhookId}`);
+          for (const payload of payloads) {
+            if (Array.isArray(payload?.changes) && payload.changes.length) {
+              await processEvents(payload.changes, form);
+              continue;
+            }
+
+            if (payload?.changedTablesById) {
+              await processChangedTablesPayload(payload.changedTablesById, form);
+              continue;
+            }
+
+            console.log('[Webhook] Unrecognized payload shape:', JSON.stringify(payload).slice(0, 500));
           }
         } catch (err) {
-          console.error('Error fetching webhook payloads:', err?.response?.data || err.message);
+          console.error('[Webhook] Error fetching webhook payloads:', err?.response?.data || err.message);
         }
       })();
 
@@ -67,24 +77,7 @@ export async function airtableWebhookHandler(req, res) {
       return res.json({ ok: true, message: "Ignoring event with no recordId" });
     }
 
-    const doc = await ResponseModel.findOne({ airtableRecordId: recordId });
-
-    if (!doc) return res.status(404).json({ error: "Record not found locally" });
-
-    if (event === "update") {
-      doc.answers = { ...doc.answers, ...fields };
-      doc.updatedAt = new Date();
-      await doc.save();
-      return res.json({ ok: true, updated: doc._id });
-    }
-
-    if (event === "delete") {
-      doc.deletedInAirtable = true;
-      doc.updatedAt = new Date();
-      await doc.save();
-      return res.json({ ok: true, deleted: doc._id });
-    }
-
+    await applyRecordUpdate({ recordId, action: event, values: fields });
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -93,7 +86,7 @@ export async function airtableWebhookHandler(req, res) {
 }
 
 // Helper: process an array of Airtable change events and update local DB
-async function processEvents(events) {
+async function processEvents(events, form) {
   if (!Array.isArray(events)) return;
 
   for (const evt of events) {
@@ -102,29 +95,125 @@ async function processEvents(events) {
         const record = evt.record;
         if (!record) continue;
 
-        const recordId = record.id;
-        const localDoc = await ResponseModel.findOne({ airtableRecordId: recordId });
-        if (!localDoc) {
-          console.log("Record not found locally:", recordId);
-          continue;
-        }
-
-        if (evt.action === "update") {
-          localDoc.answers = { ...localDoc.answers, ...(record.fields || {}) };
-          localDoc.updatedAt = new Date();
-          await localDoc.save();
-          console.log('Updated local record from webhook:', recordId);
-        }
-
-        if (evt.action === "delete") {
-          localDoc.deletedInAirtable = true;
-          localDoc.updatedAt = new Date();
-          await localDoc.save();
-          console.log('Marked local record deleted from webhook:', recordId);
-        }
+        await applyRecordUpdate({
+          recordId: record.id,
+          action: evt.action,
+          values: record.fields || record.cellValuesByFieldId || {},
+          form
+        });
       }
     } catch (err) {
       console.error('Error processing event:', err?.message || err);
     }
   }
+}
+
+async function processChangedTablesPayload(changedTablesById, form) {
+  const tables = Object.entries(changedTablesById || {});
+  for (const [tableId, tablePayload] of tables) {
+    console.log('[Webhook] Processing table payload', tableId);
+
+    const created = tablePayload?.createdRecordsById || {};
+    for (const [recordId, recordData] of Object.entries(created)) {
+      await applyRecordUpdate({
+        recordId,
+        action: 'create',
+        values: recordData?.cellValuesByFieldId || {},
+        form
+      });
+    }
+
+    const changed = tablePayload?.changedRecordsById || {};
+    for (const [recordId, changeData] of Object.entries(changed)) {
+      await applyRecordUpdate({
+        recordId,
+        action: 'update',
+        values: changeData?.current?.cellValuesByFieldId || {},
+        form
+      });
+    }
+
+    const deleted = tablePayload?.deletedRecordsById || {};
+    for (const recordId of Object.keys(deleted)) {
+      await applyRecordUpdate({ recordId, action: 'delete', values: null, form });
+    }
+  }
+}
+
+async function applyRecordUpdate({ recordId, action, values, form }) {
+  if (!recordId) return;
+
+  const localDoc = await ResponseModel.findOne({ airtableRecordId: recordId });
+  if (!localDoc) {
+    console.log(`[Webhook] Response not found for Airtable record ${recordId} (action=${action})`);
+    return;
+  }
+
+  let formDoc = form;
+  if (!formDoc || (localDoc.formId && formDoc._id?.toString() !== localDoc.formId.toString())) {
+    formDoc = await Form.findById(localDoc.formId);
+  }
+
+  if (action === 'delete') {
+    localDoc.deletedInAirtable = true;
+    localDoc.updatedAt = new Date();
+    await localDoc.save();
+    console.log(`[Webhook] Marked response ${localDoc._id} as deleted (record ${recordId})`);
+    return;
+  }
+
+  const mappedValues = mapFieldsToQuestionKeys(formDoc, values);
+  if (!Object.keys(mappedValues).length) {
+    console.log('[Webhook] No mapped values for record', recordId, values);
+    return;
+  }
+
+  localDoc.answers = { ...localDoc.answers, ...mappedValues };
+  localDoc.updatedAt = new Date();
+  await localDoc.save();
+  console.log(`[Webhook] Updated response ${localDoc._id} from record ${recordId}`, mappedValues);
+}
+
+function mapFieldsToQuestionKeys(form, values) {
+  if (!form || !values) return {};
+  const result = {};
+  const entries = Object.entries(values || {});
+
+  for (const [fieldKey, rawValue] of entries) {
+    const question = findQuestionForField(form, fieldKey);
+    if (!question) continue;
+
+    result[question.questionKey] = normalizeCellValue(rawValue);
+  }
+
+  return result;
+}
+
+function findQuestionForField(form, fieldKey) {
+  if (!form || !Array.isArray(form.questions)) return null;
+  const keyLower = (fieldKey || '').toLowerCase();
+  return (
+    form.questions.find(q => (q.airtableFieldId || '').toLowerCase() === keyLower) ||
+    form.questions.find(q => (q.label || '').toLowerCase() === keyLower)
+  );
+}
+
+function normalizeCellValue(raw) {
+  if (raw === null || raw === undefined) return raw;
+
+  if (Array.isArray(raw)) {
+    return raw.map(item => normalizeCellValue(item)).filter(v => v !== undefined);
+  }
+
+  if (typeof raw === 'object') {
+    if (Object.prototype.hasOwnProperty.call(raw, 'name')) {
+      return raw.name;
+    }
+    if (Object.prototype.hasOwnProperty.call(raw, 'value')) {
+      return raw.value;
+    }
+    return raw;
+  }
+
+  return raw;
 }
